@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/camptocamp/terraboard/auth"
 	"github.com/camptocamp/terraboard/compare"
-	"github.com/camptocamp/terraboard/db"
-	"github.com/camptocamp/terraboard/s3"
+	"github.com/camptocamp/terraboard/types"
 	"github.com/camptocamp/terraboard/util"
+	"github.com/camptocamp/terradb/pkg/client"
 )
 
 var states []string
@@ -26,9 +27,13 @@ func JSONError(w http.ResponseWriter, message string, err error) {
 }
 
 // ListStates lists States
-func ListStates(w http.ResponseWriter, r *http.Request, d *db.Database) {
+func ListStates(w http.ResponseWriter, r *http.Request, d *client.Client) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	states := d.ListStates()
+	states, err := d.ListStates()
+	if err != nil {
+		JSONError(w, "Failed to list states", err)
+		return
+	}
 
 	j, err := json.Marshal(states)
 	if err != nil {
@@ -38,54 +43,27 @@ func ListStates(w http.ResponseWriter, r *http.Request, d *db.Database) {
 	io.WriteString(w, string(j))
 }
 
-// ListTerraformVersionsWithCount lists Terraform versions with their associated
-// counts, sorted by the 'orderBy' parameter (version by default)
-func ListTerraformVersionsWithCount(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	query := r.URL.Query()
-	versions, _ := d.ListTerraformVersionsWithCount(query)
-
-	j, err := json.Marshal(versions)
-	if err != nil {
-		JSONError(w, "Failed to marshal states", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListStateStats returns State information for a given path as parameter
-func ListStateStats(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	query := r.URL.Query()
-	states, page, total := d.ListStateStats(query)
-
-	// Build response object
-	response := make(map[string]interface{})
-	response["states"] = states
-	response["page"] = page
-	response["total"] = total
-	j, err := json.Marshal(response)
-	if err != nil {
-		JSONError(w, "Failed to marshal states", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
 // GetState provides information on a State
-func GetState(w http.ResponseWriter, r *http.Request, d *db.Database) {
+func GetState(w http.ResponseWriter, r *http.Request, d *client.Client) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	st := util.TrimBase(r, "api/state/")
 	versionID := r.URL.Query().Get("versionid")
 	var err error
+	var serial int
 	if versionID == "" {
-		versionID, err = d.DefaultVersion(st)
+		serial = 0
+	} else {
+		serial, err = strconv.Atoi(versionID)
 		if err != nil {
-			JSONError(w, "Failed to retrieve default version", err)
+			JSONError(w, "Failed to parse versionID", err)
 			return
 		}
 	}
-	state := d.GetState(st, versionID)
+	state, err := d.GetState(st, serial)
+	if err != nil {
+		JSONError(w, "Failed to get state", err)
+		return
+	}
 
 	jState, err := json.Marshal(state)
 	if err != nil {
@@ -96,10 +74,14 @@ func GetState(w http.ResponseWriter, r *http.Request, d *db.Database) {
 }
 
 // GetStateActivity returns the activity (version history) of a State
-func GetStateActivity(w http.ResponseWriter, r *http.Request, d *db.Database) {
+func GetStateActivity(w http.ResponseWriter, r *http.Request, d *client.Client) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	st := util.TrimBase(r, "api/state/activity/")
-	activity := d.GetStateActivity(st)
+	activity, err := d.ListStateSerials(st)
+	if err != nil {
+		JSONError(w, "Failed to get state activity", err)
+		return
+	}
 
 	jActivity, err := json.Marshal(activity)
 	if err != nil {
@@ -110,16 +92,56 @@ func GetStateActivity(w http.ResponseWriter, r *http.Request, d *db.Database) {
 }
 
 // StateCompare compares two versions ('from' and 'to') of a State
-func StateCompare(w http.ResponseWriter, r *http.Request, d *db.Database) {
+func StateCompare(w http.ResponseWriter, r *http.Request, d *client.Client) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	st := util.TrimBase(r, "api/state/compare/")
 	query := r.URL.Query()
 	fromVersion := query.Get("from")
+	fromSerial, err := strconv.Atoi(fromVersion)
+	if err != nil {
+		JSONError(w, "Failed to parse from serial", err)
+		return
+	}
 	toVersion := query.Get("to")
+	toSerial, err := strconv.Atoi(toVersion)
+	if err != nil {
+		JSONError(w, "Failed to parse to serial", err)
+		return
+	}
 
-	from := d.GetState(st, fromVersion)
-	to := d.GetState(st, toVersion)
-	compare, err := compare.Compare(from, to)
+	from, err := d.GetState(st, fromSerial)
+	if err != nil {
+		JSONError(w, "Failed to get from state", err)
+		return
+	}
+
+	fromInt := types.State{
+		Path: from.Name,
+		Version: types.Version{
+			VersionID:    fmt.Sprintf("%v", from.Serial),
+			LastModified: from.LastModified,
+		},
+		TFVersion: from.TFVersion,
+		Serial:    from.Serial,
+	}
+
+	to, err := d.GetState(st, toSerial)
+	if err != nil {
+		JSONError(w, "Failed to get to state", err)
+		return
+	}
+
+	toInt := types.State{
+		Path: to.Name,
+		Version: types.Version{
+			VersionID:    fmt.Sprintf("%v", to.Serial),
+			LastModified: to.LastModified,
+		},
+		TFVersion: to.TFVersion,
+		Serial:    to.Serial,
+	}
+
+	compare, err := compare.Compare(fromInt, toInt)
 	if err != nil {
 		JSONError(w, "Failed to compare state versions", err)
 		return
@@ -134,103 +156,22 @@ func StateCompare(w http.ResponseWriter, r *http.Request, d *db.Database) {
 }
 
 // GetLocks returns information on locked States
-func GetLocks(w http.ResponseWriter, r *http.Request) {
+func GetLocks(w http.ResponseWriter, r *http.Request, d *client.Client) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	locks, err := s3.GetLocks()
-	if err != nil {
-		JSONError(w, "Failed to get locks", err)
-		return
-	}
+	/*
+			locks, err := s3.GetLocks()
+			if err != nil {
+				JSONError(w, "Failed to get locks", err)
+				return
+			}
 
-	j, err := json.Marshal(locks)
-	if err != nil {
-		JSONError(w, "Failed to marshal locks", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// SearchAttribute performs a search on Resource Attributes
-// by various parameters
-func SearchAttribute(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	query := r.URL.Query()
-	result, page, total := d.SearchAttribute(query)
-
-	// Build response object
-	response := make(map[string]interface{})
-	response["results"] = result
-	response["page"] = page
-	response["total"] = total
-
-	j, err := json.Marshal(response)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListResourceTypes lists all Resource types
-func ListResourceTypes(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	result, _ := d.ListResourceTypes()
-	j, err := json.Marshal(result)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListResourceTypesWithCount lists all Resource types with their associated count
-func ListResourceTypesWithCount(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	result, _ := d.ListResourceTypesWithCount()
-	j, err := json.Marshal(result)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListResourceNames lists all Resource names
-func ListResourceNames(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	result, _ := d.ListResourceNames()
-	j, err := json.Marshal(result)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListAttributeKeys lists all Resource Attribute Keys,
-// optionally filtered by resource_type
-func ListAttributeKeys(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	resourceType := r.URL.Query().Get("resource_type")
-	result, _ := d.ListAttributeKeys(resourceType)
-	j, err := json.Marshal(result)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
-}
-
-// ListTfVersions lists all Terraform versions
-func ListTfVersions(w http.ResponseWriter, r *http.Request, d *db.Database) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	result, _ := d.ListTfVersions()
-	j, err := json.Marshal(result)
-	if err != nil {
-		JSONError(w, "Failed to marshal json", err)
-		return
-	}
-	io.WriteString(w, string(j))
+			j, err := json.Marshal(locks)
+			if err != nil {
+				JSONError(w, "Failed to marshal locks", err)
+				return
+			}
+		io.WriteString(w, string(j))
+	*/
 }
 
 // GetUser returns information about the logged user
